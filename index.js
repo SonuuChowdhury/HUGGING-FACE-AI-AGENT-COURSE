@@ -21,8 +21,7 @@ function getModel() {
   return genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 }
 
-// ================= UTILS =================
-const sleep = ms => new Promise(res => setTimeout(res, ms));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
 
 // ================= SAFE GENERATE =================
 async function safeGenerate(messages, retries = 0) {
@@ -32,12 +31,12 @@ async function safeGenerate(messages, retries = 0) {
 
   } catch (err) {
     if (err.status === 429 && retries < keys.length) {
-      await sleep(1000);
+      await sleep(800);
       return safeGenerate(messages, retries + 1);
     }
 
     if (retries >= keys.length) {
-      await sleep(10000);
+      await sleep(8000);
       return safeGenerate(messages, 0);
     }
 
@@ -45,23 +44,7 @@ async function safeGenerate(messages, retries = 0) {
   }
 }
 
-// ================= TOOLS =================
-async function searchTool(query) {
-  try {
-    const res = await axios.get(
-      `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json`
-    );
-
-    return (
-      res.data.Abstract ||
-      res.data.RelatedTopics?.map(r => r.Text).slice(0, 3).join("\n") ||
-      "No result"
-    );
-  } catch {
-    return "Search failed";
-  }
-}
-
+// ================= FILE =================
 async function getFile(task_id) {
   try {
     const res = await axios.get(`${BASE_URL}/files/${task_id}`, {
@@ -70,85 +53,118 @@ async function getFile(task_id) {
 
     return res.data.toString("utf-8");
   } catch {
-    return null;
+    return "";
   }
 }
 
-// ================= 🔥 SMART EXTRACTOR =================
-function quickExtract(question, file) {
+// ================= 🧠 QUESTION TYPE =================
+function detectType(q) {
+  q = q.toLowerCase();
+
+  if (q.includes("total") || q.includes("sum")) return "sum";
+  if (q.includes("average") || q.includes("mean")) return "avg";
+  if (q.includes("how many")) return "count";
+  if (q.includes("list")) return "list";
+  if (q.includes("code") || q.includes("id")) return "code";
+  if (q.includes("who") || q.includes("name")) return "name";
+  if (q.includes("where") || q.includes("city") || q.includes("country")) return "place";
+  if (q.includes("which") || q.includes("choose")) return "mcq";
+
+  return "unknown";
+}
+
+// ================= 🔥 PARSERS =================
+function extractNumbers(text) {
+  return (text.match(/-?\d+(\.\d+)?/g) || []).map(Number);
+}
+
+function extractWords(text) {
+  return text.match(/[A-Za-z]+/g) || [];
+}
+
+function extractCodes(text) {
+  return text.match(/[A-Z0-9]{6,}/g) || [];
+}
+
+function extractNames(text) {
+  return text.match(/[A-Z][a-z]+/g) || [];
+}
+
+// ================= 🔥 SMART SOLVER =================
+function solveDeterministic(question, file) {
   if (!file) return null;
 
-  const q = question.toLowerCase();
+  const type = detectType(question);
 
-  // 🔢 sum / total
-  if (q.includes("total") || q.includes("sum")) {
-    const nums = file.match(/-?\d+(\.\d+)?/g);
-    if (nums) {
-      const sum = nums.reduce((a, b) => a + Number(b), 0);
-      return String(sum);
+  // 🔢 SUM
+  if (type === "sum") {
+    const nums = extractNumbers(file);
+    if (nums.length) {
+      const sum = nums.reduce((a, b) => a + b, 0);
+      return String(Math.round(sum * 100) / 100);
     }
   }
 
-  // 🔢 find numbers
-  if (q.includes("list") || q.includes("numbers")) {
-    const nums = file.match(/\d+/g);
-    if (nums) return nums.slice(0, 6).join(",");
+  // 🔢 AVERAGE
+  if (type === "avg") {
+    const nums = extractNumbers(file);
+    if (nums.length) {
+      const avg = nums.reduce((a, b) => a + b, 0) / nums.length;
+      return String(Math.round(avg * 100) / 100);
+    }
   }
 
-  // 🔤 code / id
-  if (q.includes("code") || q.includes("id")) {
-    const code = file.match(/[A-Z0-9]{6,}/);
-    if (code) return code[0];
+  // 🔢 COUNT
+  if (type === "count") {
+    const items = file.split(/\n|,/).filter(x => x.trim());
+    return String(items.length);
   }
 
-  // 👤 names
-  if (q.includes("who") || q.includes("name")) {
-    const names = file.match(/[A-Z][a-z]+/g);
-    if (names) return names[0];
+  // 📦 LIST
+  if (type === "list") {
+    const items = file
+      .split(/\n|,/)
+      .map(x => x.trim())
+      .filter(Boolean);
+
+    return items.slice(0, 10).join(", ");
   }
 
-  // 🌍 country / city
-  if (q.includes("where") || q.includes("city") || q.includes("country")) {
-    const places = file.match(/[A-Z][a-z]+/g);
-    if (places) return places[0];
+  // 🔤 CODE
+  if (type === "code") {
+    const codes = extractCodes(file);
+    if (codes.length) return codes[0];
   }
 
-  // 📦 CSV-like lists
-  if (file.includes(",") && (q.includes("list") || q.includes("ingredients"))) {
-    return file
-      .split(",")
-      .map(s => s.trim())
-      .filter(Boolean)
-      .slice(0, 10)
-      .join(", ");
+  // 👤 NAME
+  if (type === "name") {
+    const names = extractNames(file);
+    if (names.length) return names[0];
+  }
+
+  // 🌍 PLACE
+  if (type === "place") {
+    const names = extractNames(file);
+    if (names.length) return names[0];
   }
 
   return null;
 }
 
-// ================= AGENT =================
-async function runAgent(question, task_id) {
-  const fileContent = await getFile(task_id);
-
-  // 🔥 FIRST: deterministic extraction
-  const extracted = quickExtract(question, fileContent);
-  if (extracted) return extracted;
-
-  // fallback → LLM
-  let messages = [
+// ================= 🤖 LLM FALLBACK =================
+async function askLLM(question, file) {
+  const messages = [
     {
       role: "user",
       parts: [{
         text: `
-Answer VERY briefly.
+Answer in ONE word or short phrase only.
 
-Rules:
-- One word or short phrase
-- No explanation
-- No "I cannot"
-- No guessing sentences
+No explanation.
+No "I cannot".
+No sentences.
 
-${fileContent ? `FILE:\n${fileContent.slice(0, 2000)}` : ""}
+${file ? `FILE:\n${file.slice(0, 2000)}` : ""}
 
 Question: ${question}
 `
@@ -156,51 +172,37 @@ Question: ${question}
     }
   ];
 
-  let finalAnswer = "";
-
-  for (let step = 0; step < 5; step++) {
-    const result = await safeGenerate(messages);
-    const output = result.response.text().trim();
-
-    messages.push({
-      role: "model",
-      parts: [{ text: output }]
-    });
-
-    if (output.toLowerCase().includes("search:")) {
-      const query = output.split("search:")[1]?.trim();
-      if (query) {
-        const obs = await searchTool(query);
-
-        messages.push({
-          role: "user",
-          parts: [{ text: `Search:\n${obs}` }]
-        });
-        continue;
-      }
-    }
-
-    finalAnswer = output;
-    break;
-  }
-
-  return cleanAnswer(finalAnswer);
+  const res = await safeGenerate(messages);
+  return res.response.text().trim();
 }
 
 // ================= CLEAN =================
-function cleanAnswer(ans) {
+function clean(ans) {
   if (!ans) return "N/A";
 
-  const bad = ["cannot", "unknown", "not provided", "no data"];
+  const bad = ["cannot", "unknown", "not provided", "missing", "unavailable"];
 
   if (bad.some(b => ans.toLowerCase().includes(b))) {
     return "N/A";
   }
 
   return ans
-    .replace(/final answer:/gi, "")
     .replace(/\n/g, " ")
+    .replace(/final answer:/gi, "")
     .trim();
+}
+
+// ================= AGENT =================
+async function runAgent(question, task_id) {
+  const file = await getFile(task_id);
+
+  // 🔥 1. deterministic solve
+  const det = solveDeterministic(question, file);
+  if (det) return det;
+
+  // 🔥 2. fallback LLM
+  const llm = await askLLM(question, file);
+  return clean(llm);
 }
 
 // ================= API =================
@@ -211,8 +213,8 @@ async function getQuestions() {
 
 async function submitAnswers(answers) {
   const payload = {
-    username: "SonuChowdhury", 
-    agent_code: "https://github.com/SonuuChowdhury/HUGGING-FACE-AI-AGENT-COURSE", 
+    username: "SonuChowdhury",
+    agent_code: "https://github.com/SonuuChowdhury/HUGGING-FACE-AI-AGENT-COURSE",
 
     answers: answers.map(a => ({
       task_id: a.task_id,
