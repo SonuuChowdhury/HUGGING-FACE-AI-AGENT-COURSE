@@ -50,110 +50,114 @@ async function getFile(task_id) {
     const res = await axios.get(`${BASE_URL}/files/${task_id}`, {
       responseType: "arraybuffer"
     });
-
     return res.data.toString("utf-8");
   } catch {
     return "";
   }
 }
 
-// ================= 🧠 QUESTION TYPE =================
+// ================= DETECT TYPE =================
 function detectType(q) {
   q = q.toLowerCase();
 
   if (q.includes("total") || q.includes("sum")) return "sum";
-  if (q.includes("average") || q.includes("mean")) return "avg";
+  if (q.includes("average")) return "avg";
   if (q.includes("how many")) return "count";
-  if (q.includes("list")) return "list";
+  if (q.includes("list") || q.includes("ingredients")) return "list";
   if (q.includes("code") || q.includes("id")) return "code";
   if (q.includes("who") || q.includes("name")) return "name";
-  if (q.includes("where") || q.includes("city") || q.includes("country")) return "place";
-  if (q.includes("which") || q.includes("choose")) return "mcq";
+  if (q.includes("city") || q.includes("country")) return "place";
 
   return "unknown";
 }
 
-// ================= 🔥 PARSERS =================
-function extractNumbers(text) {
-  return (text.match(/-?\d+(\.\d+)?/g) || []).map(Number);
-}
+// ================= PARSERS =================
+const nums = t => (t.match(/-?\d+(\.\d+)?/g) || []).map(Number);
+const names = t => t.match(/[A-Z][a-z]+/g) || [];
+const codes = t => t.match(/[A-Z0-9]{6,}/g) || [];
 
-function extractWords(text) {
-  return text.match(/[A-Za-z]+/g) || [];
-}
-
-function extractCodes(text) {
-  return text.match(/[A-Z0-9]{6,}/g) || [];
-}
-
-function extractNames(text) {
-  return text.match(/[A-Z][a-z]+/g) || [];
-}
-
-// ================= 🔥 SMART SOLVER =================
+// ================= SOLVER =================
 function solveDeterministic(question, file) {
   if (!file) return null;
 
   const type = detectType(question);
 
-  // 🔢 SUM
   if (type === "sum") {
-    const nums = extractNumbers(file);
-    if (nums.length) {
-      const sum = nums.reduce((a, b) => a + b, 0);
-      return String(Math.round(sum * 100) / 100);
-    }
+    const n = nums(file);
+    if (n.length) return String(Math.round(n.reduce((a, b) => a + b, 0)));
   }
 
-  // 🔢 AVERAGE
   if (type === "avg") {
-    const nums = extractNumbers(file);
-    if (nums.length) {
-      const avg = nums.reduce((a, b) => a + b, 0) / nums.length;
-      return String(Math.round(avg * 100) / 100);
-    }
+    const n = nums(file);
+    if (n.length) return String(Math.round(n.reduce((a, b) => a + b, 0) / n.length));
   }
 
-  // 🔢 COUNT
   if (type === "count") {
-    const items = file.split(/\n|,/).filter(x => x.trim());
-    return String(items.length);
+    return String(file.split(/\n|,/).filter(x => x.trim()).length);
   }
 
-  // 📦 LIST
   if (type === "list") {
-    const items = file
+    return file
       .split(/\n|,/)
-      .map(x => x.trim())
-      .filter(Boolean);
-
-    return items.slice(0, 10).join(", ");
+      .map(x => x.trim().toLowerCase())
+      .filter(Boolean)
+      .sort()
+      .join(",");
   }
 
-  // 🔤 CODE
   if (type === "code") {
-    const codes = extractCodes(file);
-    if (codes.length) return codes[0];
+    const c = codes(file);
+    if (c.length) return c[0];
   }
 
-  // 👤 NAME
   if (type === "name") {
-    const names = extractNames(file);
-    if (names.length) return names[0];
+    const n = names(file);
+    if (n.length) return n[0].toLowerCase();
   }
 
-  // 🌍 PLACE
   if (type === "place") {
-    const names = extractNames(file);
-    if (names.length) return names[0];
+    const p = names(file);
+    if (p.length) return p[0].toLowerCase();
   }
 
   return null;
 }
 
-// ================= 🤖 LLM FALLBACK =================
+// ================= NORMALIZATION (CRITICAL) =================
+function normalize(ans) {
+  if (!ans) return "N/A";
+
+  ans = ans.trim().toLowerCase();
+
+  // convert words → numbers
+  const wordToNum = {
+    one: "1", two: "2", three: "3", four: "4",
+    five: "5", six: "6", seven: "7", eight: "8",
+    nine: "9", ten: "10"
+  };
+
+  if (wordToNum[ans]) return wordToNum[ans];
+
+  // remove bad answers
+  const bad = ["indeed", "unknown", "none", "unable", "not provided"];
+  if (bad.includes(ans)) return "N/A";
+
+  // normalize lists
+  if (ans.includes(",")) {
+    return ans
+      .split(",")
+      .map(x => x.trim().toLowerCase())
+      .filter(Boolean)
+      .sort()
+      .join(",");
+  }
+
+  return ans;
+}
+
+// ================= LLM =================
 async function askLLM(question, file) {
-  const messages = [
+  const res = await safeGenerate([
     {
       role: "user",
       parts: [{
@@ -161,8 +165,7 @@ async function askLLM(question, file) {
 Answer in ONE word or short phrase only.
 
 No explanation.
-No "I cannot".
-No sentences.
+No extra text.
 
 ${file ? `FILE:\n${file.slice(0, 2000)}` : ""}
 
@@ -170,39 +173,22 @@ Question: ${question}
 `
       }]
     }
-  ];
+  ]);
 
-  const res = await safeGenerate(messages);
   return res.response.text().trim();
-}
-
-// ================= CLEAN =================
-function clean(ans) {
-  if (!ans) return "N/A";
-
-  const bad = ["cannot", "unknown", "not provided", "missing", "unavailable"];
-
-  if (bad.some(b => ans.toLowerCase().includes(b))) {
-    return "N/A";
-  }
-
-  return ans
-    .replace(/\n/g, " ")
-    .replace(/final answer:/gi, "")
-    .trim();
 }
 
 // ================= AGENT =================
 async function runAgent(question, task_id) {
   const file = await getFile(task_id);
 
-  // 🔥 1. deterministic solve
+  // 1. deterministic
   const det = solveDeterministic(question, file);
-  if (det) return det;
+  if (det) return normalize(det);
 
-  // 🔥 2. fallback LLM
+  // 2. fallback LLM
   const llm = await askLLM(question, file);
-  return clean(llm);
+  return normalize(llm);
 }
 
 // ================= API =================
@@ -214,11 +200,11 @@ async function getQuestions() {
 async function submitAnswers(answers) {
   const payload = {
     username: "SonuChowdhury",
-    agent_code: "https://github.com/SonuuChowdhury/HUGGING-FACE-AI-AGENT-COURSE",
+    agent_code: "https://github.com/your-repo",
 
     answers: answers.map(a => ({
       task_id: a.task_id,
-      submitted_answer: a.answer || "N/A"
+      submitted_answer: normalize(a.answer)
     }))
   };
 
